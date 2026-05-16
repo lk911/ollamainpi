@@ -36,6 +36,20 @@ import { chatComplete, disposeLoaded, ensureLoaded, tokenize } from "./inference
 import { getServerPort, startServer, stopServer } from "./server.ts";
 
 const PROVIDER_NAME = "ollamainpi";
+const API_KEY_ENV = "OLLAMAINPI_API_KEY";
+
+/**
+ * PI treats the `apiKey` field on a provider config as an *environment variable
+ * name* (see the docs example: `apiKey: "LOCAL_OPENAI_API_KEY"`). It then reads
+ * `process.env[apiKey]` and considers the model unusable if that env var is
+ * empty. Our local HTTP server doesn't actually need any auth, so we just make
+ * sure the env var exists with a dummy value.
+ */
+function ensureApiKeyEnv(): void {
+  if (!process.env[API_KEY_ENV]) {
+    process.env[API_KEY_ENV] = "local";
+  }
+}
 
 /**
  * Build the provider config that PI consumes. We point it at our own local
@@ -46,9 +60,8 @@ function buildProviderConfig(models: RegisteredModel[], port: number) {
   return {
     name: "Ollama in PI (local)",
     baseUrl: `http://127.0.0.1:${port}/v1`,
-    // PI requires an apiKey field; the value is irrelevant for a local server
-    // but cannot be empty. Use a literal sentinel.
-    apiKey: "ollamainpi-local",
+    // env var name - we ensure it's set in ensureApiKeyEnv()
+    apiKey: API_KEY_ENV,
     api: "openai-completions" as const,
     models: models.map((m) => ({
       id: m.id,
@@ -64,17 +77,32 @@ function buildProviderConfig(models: RegisteredModel[], port: number) {
 
 /**
  * Re-register the provider with the current registry. Call this any time the
- * set of models changes (pull, rm, config change).
+ * set of models changes (pull, rm, config change). If the HTTP server isn't
+ * up yet we still register against the configured port so PI's `/model`
+ * picker sees the new model immediately - the server will be on that same
+ * port once it finishes binding.
  */
 async function refreshProvider(pi: ExtensionAPI): Promise<void> {
-  const port = getServerPort();
-  if (!port) return; // server not up yet; will register when it starts
+  ensureApiKeyEnv();
+  const port = getServerPort() ?? (await loadSettings()).serverPort;
   const models = await listModels();
   pi.registerProvider(PROVIDER_NAME, buildProviderConfig(models, port) as any);
 }
 
+/**
+ * Try to make a local model the active PI model. Returns true on success.
+ * Looks the model up in PI's model registry (populated by registerProvider)
+ * and then calls pi.setModel().
+ */
+async function activateModel(pi: ExtensionAPI, ctx: any, id: string): Promise<boolean> {
+  const model = ctx.modelRegistry?.find?.(PROVIDER_NAME, id);
+  if (!model) return false;
+  return await pi.setModel(model);
+}
+
 export default async function (pi: ExtensionAPI): Promise<void> {
   await ensureDirs();
+  ensureApiKeyEnv();
   const settings = await loadSettings();
 
   // ----- Provider registration (eager so /model + --list-models work) -----
@@ -180,9 +208,57 @@ export default async function (pi: ExtensionAPI): Promise<void> {
           "info",
         );
         await refreshProvider(pi);
+
+        // Offer to switch PI to the new model as the active conversation model.
+        if (ctx.hasUI) {
+          const switchNow = await ctx.ui.confirm(
+            "Use as active model?",
+            `Make ${model.id} the current PI model (so /model would show it selected)?`,
+          );
+          if (switchNow) {
+            const ok = await activateModel(pi, ctx, model.id);
+            if (ok) {
+              ctx.ui.notify(`Now talking to ${model.id}`, "info");
+            } else {
+              ctx.ui.notify(
+                `Could not switch automatically. Open /model and pick "Ollama in PI (local)" > ${model.id}`,
+                "warning",
+              );
+            }
+          }
+        }
       } catch (err) {
         ctx.ui.setStatus("ollamainpi", undefined);
         ctx.ui.notify(`Pull failed: ${(err as Error).message}`, "error");
+      }
+    },
+  });
+
+  // /llm:use <id> - make a local model the active PI conversation model
+  pi.registerCommand("llm:use", {
+    description: "Switch PI to talk to a local model. Usage: /llm:use <id>",
+    getArgumentCompletions: async (prefix: string) => {
+      const models = await listModels();
+      return models
+        .filter((m) => m.id.startsWith(prefix))
+        .map((m) => ({ value: m.id, label: m.id }));
+    },
+    handler: async (args, ctx) => {
+      const id = (args ?? "").trim();
+      if (!id) {
+        ctx.ui.notify("Usage: /llm:use <id>", "warning");
+        return;
+      }
+      // Make sure the provider is up to date before we look the model up.
+      await refreshProvider(pi);
+      const ok = await activateModel(pi, ctx, id);
+      if (ok) {
+        ctx.ui.notify(`Now talking to ${id}`, "info");
+      } else {
+        ctx.ui.notify(
+          `Could not switch to ${id}. Is it installed? Try /llm:list`,
+          "error",
+        );
       }
     },
   });
