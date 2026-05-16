@@ -1,0 +1,13 @@
+{
+  "name": "ollamainpi",
+  "version": "0.1.0",
+  "description": "Ollama-like local LLM manager for PI coding agent (powered by node-llama-cpp)",
+  "private": true,
+  "dependencies": {
+    "node-llama-cpp": "^3.4.0",
+    "typebox": "npm:@sinclair/typebox@^0.34.0"
+  },
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  }
+}
